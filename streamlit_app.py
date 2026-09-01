@@ -464,6 +464,33 @@ def parse_arr(val) -> float:
     except ValueError:
         return 0.0
 
+_FY18_FIELD = "FY18 Sales Planning"
+
+def clean_fy18(val: str) -> str:
+    """
+    Remove all 'Prev Acct Owner: ...' tags from the FY18 Sales Planning field.
+    Handles common separators (|  ;  ,  newline) before/after the tag so the
+    remaining text stays clean.
+
+    Examples:
+      "Prev Acct Owner: Jane Doe"                   → ""
+      "Prev Acct Owner: Jane Doe | Some note"        → "Some note"
+      "Some note | Prev Acct Owner: Jane Doe"        → "Some note"
+      "Note 1 | Prev Acct Owner: Jane Doe | Note 2"  → "Note 1 | Note 2"
+    """
+    if not val:
+        return val
+    s = str(val)
+    # Remove tag that follows a separator (keep the separator's spacing normalised later)
+    s = re.sub(r'[|;,]\s*Prev Acct Owner\s*:[^|;,\n]*', '', s, flags=re.IGNORECASE)
+    # Remove tag at the very start (no preceding separator)
+    s = re.sub(r'^\s*Prev Acct Owner\s*:[^|;,\n]*', '', s, flags=re.IGNORECASE)
+    # Normalise spacing around remaining pipe separators
+    s = re.sub(r'\s*\|\s*', ' | ', s)
+    # Clean up any leftover leading/trailing separators or whitespace
+    s = re.sub(r'^[\s|;,]+|[\s|;,]+$', '', s)
+    return s.strip()
+
 def build_pools(vol_rows: list, new_accounts: list) -> dict:
     cse_count  = defaultdict(int)
     cse_arr    = defaultdict(float)
@@ -529,6 +556,9 @@ def preprocess_accounts(rows: list):
         arr = parse_arr(arr_raw)
         csm_raw = row.get("SecondAccountOwner") or row.get("Second Account Owner") or ""
         row = dict(row)
+        # Strip any stale "Prev Acct Owner: ..." tags from the FY18 Sales Planning field
+        if _FY18_FIELD in row:
+            row[_FY18_FIELD] = clean_fy18(row[_FY18_FIELD])
         row.update({"segment": segment, "ob_csm": norm_csm(csm_raw),
                     "arr": arr, "is_sub75k": arr < 7500})
         valid.append(row)
