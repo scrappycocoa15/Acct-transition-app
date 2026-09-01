@@ -377,16 +377,31 @@ def sf_login(email: str, password: str, security_token: str) -> tuple:
     ns_env = "http://schemas.xmlsoap.org/soap/envelope/"
     ns_sf  = "urn:partner.soap.sforce.com"
 
-    # Surface SOAP faults (wrong password, locked account, etc.)
-    fault = root.find(f".//{{{ns_env}}}faultstring")
+    # SOAP faults: faultstring lives in NO namespace (bare element), not in the
+    # envelope namespace — search both to be safe.
+    fault = (
+        root.find(".//faultstring") or
+        root.find(f".//{{{ns_env}}}faultstring")
+    )
     if fault is not None:
         raise PermissionError(f"Salesforce login failed: {fault.text}")
 
-    session_id  = root.findtext(f".//{{{ns_sf}}}sessionId")
-    server_url  = root.findtext(f".//{{{ns_sf}}}serverUrl")
+    # sessionId may be in the sf namespace or in no namespace depending on SFDC version
+    session_id = (
+        root.findtext(f".//{{{ns_sf}}}sessionId") or
+        root.findtext(".//sessionId")
+    )
+    server_url = (
+        root.findtext(f".//{{{ns_sf}}}serverUrl") or
+        root.findtext(".//serverUrl")
+    )
 
     if not session_id:
-        raise PermissionError("Login succeeded but Salesforce returned no session ID.")
+        # Surface the raw response so the user can see what Salesforce actually said
+        raise PermissionError(
+            f"Salesforce did not return a session ID (HTTP {resp.status_code}). "
+            f"Raw response: {resp.text[:400]}"
+        )
 
     # Derive the instance URL from the serverUrl
     # e.g. https://sapconcur.my.salesforce.com/services/Soap/...  →  https://sapconcur.my.salesforce.com
