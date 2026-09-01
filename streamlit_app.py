@@ -1,10 +1,10 @@
 """
 CSE Account Assignment Tool  —  Streamlit App
-Fetches two Salesforce reports via session ID, applies RSE→CSE
-assignment algorithm, and exports results as Excel.
+Authenticates to Salesforce via username/password/security token,
+fetches two reports, applies RSE→CSE assignment algorithm, exports to Excel.
 """
 
-import io, re, time, math
+import io, re, time, math, xml.etree.ElementTree as ET
 from collections import defaultdict
 
 import requests
@@ -339,6 +339,64 @@ def get_partnered_cses(segment: str, csm_raw: str) -> list:
 def sf_headers(sid: str) -> dict:
     return {"Authorization": f"Bearer {sid}", "Accept": "application/json",
             "Content-Type": "application/json"}
+
+def sf_login(email: str, password: str, security_token: str) -> tuple:
+    """
+    Authenticate via the Salesforce SOAP Partner API.
+    Returns (session_id, instance_url).
+
+    Unlike the browser sid cookie, the session produced here is an API
+    session — not bound to the originating IP address — so it works from
+    any server, including Streamlit Cloud.
+    """
+    soap = f"""<?xml version="1.0" encoding="utf-8"?>
+<soapenv:Envelope
+    xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/"
+    xmlns:urn="urn:partner.soap.sforce.com">
+  <soapenv:Body>
+    <urn:login>
+      <urn:username>{email}</urn:username>
+      <urn:password>{password}{security_token}</urn:password>
+    </urn:login>
+  </soapenv:Body>
+</soapenv:Envelope>"""
+
+    try:
+        resp = requests.post(
+            "https://login.salesforce.com/services/Soap/u/59.0",
+            data=soap.encode("utf-8"),
+            headers={"Content-Type": "text/xml; charset=UTF-8", "SOAPAction": "login"},
+            timeout=30,
+        )
+    except requests.exceptions.Timeout:
+        raise TimeoutError("Login request timed out. Check your network connection.")
+    except Exception as e:
+        raise RuntimeError(f"Login request failed: {e}")
+
+    root = ET.fromstring(resp.text)
+    ns_env = "http://schemas.xmlsoap.org/soap/envelope/"
+    ns_sf  = "urn:partner.soap.sforce.com"
+
+    # Surface SOAP faults (wrong password, locked account, etc.)
+    fault = root.find(f".//{{{ns_env}}}faultstring")
+    if fault is not None:
+        raise PermissionError(f"Salesforce login failed: {fault.text}")
+
+    session_id  = root.findtext(f".//{{{ns_sf}}}sessionId")
+    server_url  = root.findtext(f".//{{{ns_sf}}}serverUrl")
+
+    if not session_id:
+        raise PermissionError("Login succeeded but Salesforce returned no session ID.")
+
+    # Derive the instance URL from the serverUrl
+    # e.g. https://sapconcur.my.salesforce.com/services/Soap/...  →  https://sapconcur.my.salesforce.com
+    instance_url = SF_INSTANCE
+    if server_url:
+        from urllib.parse import urlparse
+        parsed = urlparse(server_url)
+        instance_url = f"{parsed.scheme}://{parsed.netloc}"
+
+    return session_id, instance_url
 
 def parse_sf_report(data: dict) -> list:
     meta   = data.get("reportMetadata", {})
@@ -820,7 +878,7 @@ st.markdown("""
 <div class="tool-header">
   <div>
     <h1>CSE Account Assignment Tool</h1>
-    <p>Upload Salesforce CSV exports &nbsp;·&nbsp; Applies RSE → CSE balancing algorithm &nbsp;·&nbsp; Exports to Excel</p>
+    <p>Connects to Salesforce &nbsp;·&nbsp; Applies RSE → CSE balancing algorithm &nbsp;·&nbsp; Exports to Excel</p>
   </div>
 </div>
 """, unsafe_allow_html=True)
@@ -835,22 +893,23 @@ with st.sidebar:
     alex_override = st.checkbox("Alex Capeloto — min. 1 account", value=True)
 
     st.divider()
-    st.markdown("### How to export from Salesforce")
+    st.markdown("### Salesforce login")
     st.markdown("""
-**New Accounts report** (`00O0e000005i4gg`)  
-**Account Volumes report** (`00O7V000006IT4i`)
+Sign in with your standard Salesforce credentials plus a **Security Token**.
 
-For each report:
-1. Open the report in Salesforce
-2. Click **Export** (top-right)
-3. Choose **Details Only**
-4. Click **Export** → **Formatted Report: CSV**
-5. Upload both files in the app
+**To get your security token:**
+1. In Salesforce, click your profile icon → **Settings**
+2. Go to **My Personal Information** → **Reset My Security Token**
+3. Salesforce emails it to your address on file
 
----
-**Live fetch option**  
-Switch to **Live Salesforce Fetch** mode and paste your `sid` cookie (DevTools → Application → Cookies → `sapconcur.my.salesforce.com`).  
-Note: this may time out if Salesforce restricts API calls from cloud servers. CSV upload is more reliable.
+Your credentials are sent directly to Salesforce and never stored.
+""")
+    st.divider()
+    st.markdown("### CSV fallback")
+    st.markdown("""
+If login is unavailable, switch to **Upload CSV Files** mode.
+
+For each report, open it in Salesforce → **Export** → **Details Only** → **Formatted Report: CSV**.
 """)
 
 # ── Overrides dict from sidebar ───────────────────────────────────────────────
@@ -860,31 +919,124 @@ active_overrides = {
 }
 
 # ── Input mode toggle ────────────────────────────────────────────────────────
-st.markdown(
-    '<div class="info-box">'
-    '<strong>Recommended workflow:</strong> Export both Salesforce reports as CSV and upload them below. '
-    'The live Salesforce fetch can time out because Salesforce restricts API calls that originate '
-    'from cloud servers (IP mismatch with your browser session). CSV upload is instant and fully reliable.'
-    '</div>',
-    unsafe_allow_html=True,
-)
-
 input_mode = st.radio(
     "Data source",
-    ["Upload CSV Files", "Live Salesforce Fetch"],
+    ["Salesforce Login", "Upload CSV Files"],
     horizontal=True,
     label_visibility="collapsed",
 )
 
 new_rows = None
 vol_rows = None
-run_clicked = False
 
-if input_mode == "Upload CSV Files":
+if input_mode == "Salesforce Login":
     st.markdown(
         '<div class="info-box">'
-        'In Salesforce, open each report → click <strong>Export</strong> → <strong>Details Only</strong> → <strong>Export</strong> → choose <strong>Formatted Report: CSV</strong>. '
-        'Upload both files below.'
+        'Sign in with your Salesforce email, password, and security token. '
+        'This creates an API session (not tied to your browser IP) so fetches work reliably from any server. '
+        'See the sidebar for how to get your security token.'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+
+    col_email, col_pass, col_token = st.columns([2, 2, 1.5])
+    with col_email:
+        sf_email = st.text_input("Salesforce Email", placeholder="you@company.com",
+                                  label_visibility="visible")
+    with col_pass:
+        sf_password = st.text_input("Password", type="password",
+                                     label_visibility="visible")
+    with col_token:
+        sf_token = st.text_input("Security Token", type="password",
+                                  label_visibility="visible",
+                                  help="Find this in Salesforce → Settings → My Personal Information → Reset My Security Token")
+
+    col_test, col_run, col_spacer = st.columns([1.4, 1.4, 5])
+    with col_test:
+        test_clicked = st.button("Test Connection", use_container_width=True)
+    with col_run:
+        run_clicked = st.button("Fetch & Assign", type="primary", use_container_width=True)
+
+    def _get_credentials():
+        """Validate and return (email, password, token). Shows error and stops if blank."""
+        if not sf_email.strip() or not sf_password.strip() or not sf_token.strip():
+            st.error("Enter your Salesforce email, password, and security token before continuing.")
+            st.stop()
+        return sf_email.strip(), sf_password.strip(), sf_token.strip()
+
+    if test_clicked:
+        email, pwd, tok = _get_credentials()
+        with st.spinner("Logging in to Salesforce…"):
+            try:
+                sid, _ = sf_login(email, pwd, tok)
+            except (PermissionError, TimeoutError, RuntimeError) as e:
+                st.error(f"**Login failed:** {e}")
+                st.stop()
+
+        with st.spinner("Testing report access…"):
+            result = test_connection(sid)
+
+        for step in result["steps"]:
+            icon = "**:green[PASS]**" if step["ok"] else "**:red[FAIL]**"
+            st.markdown(f"{icon} &nbsp; **{step['label']}** — {step['detail']}")
+
+        if result["ok"]:
+            st.success("All checks passed. Click **Fetch & Assign** to run the assignment.")
+        else:
+            st.warning("One or more checks failed — review the details above.")
+
+    if run_clicked:
+        email, pwd, tok = _get_credentials()
+
+        try:
+            with st.status("Connecting to Salesforce…", expanded=True) as sf_status:
+                _sflog = lambda msg: sf_status.update(label=msg)
+
+                sf_status.update(label="Logging in…")
+                sid, _ = sf_login(email, pwd, tok)
+
+                sf_status.update(label="Fetching New Accounts report…")
+                new_rows = fetch_report(sid, RPT_NEW_ACCOUNTS, status_fn=_sflog)
+
+                sf_status.update(
+                    label=f"New Accounts: {len(new_rows)} rows.  Fetching Account Volumes…"
+                )
+                vol_rows = fetch_report(sid, RPT_VOLUMES, status_fn=_sflog)
+
+                sf_status.update(
+                    label=f"Volumes: {len(vol_rows)} rows.  Running algorithm…",
+                    state="running",
+                )
+                payload = run_assignment(new_rows, vol_rows, active_overrides)
+                sf_status.update(label="Complete.", state="complete")
+
+            st.session_state["payload"]    = payload
+            st.session_state["new_rows_n"] = len(new_rows)
+            st.session_state["vol_rows_n"] = len(vol_rows)
+
+        except PermissionError as e:
+            st.error(
+                f"**Authentication failed:** {e}  \n\n"
+                "Check your email, password, and security token and try again. "
+                "If you recently reset your password, request a new security token."
+            )
+            st.stop()
+        except TimeoutError as e:
+            st.error(
+                f"**Timeout:** {e}  \n\n"
+                "Try again in a minute, or switch to **Upload CSV Files** mode."
+            )
+            st.stop()
+        except Exception as e:
+            st.error(f"**Unexpected error:** {e}")
+            st.stop()
+
+else:
+    # ── CSV upload fallback ───────────────────────────────────────────────────
+    st.markdown(
+        '<div class="info-box">'
+        'In Salesforce, open each report → <strong>Export</strong> → <strong>Details Only</strong> '
+        '→ <strong>Formatted Report: CSV</strong>. Upload both files below.'
         '</div>',
         unsafe_allow_html=True,
     )
@@ -930,118 +1082,6 @@ if input_mode == "Upload CSV Files":
         except Exception as e:
             st.error(f"**Error processing uploaded files:** {e}")
             st.stop()
-
-elif input_mode == "Live Salesforce Fetch":
-    col_input, col_test, col_btn = st.columns([5, 1.4, 1.4])
-    with col_input:
-        session_id = st.text_input(
-            "Salesforce Session ID",
-            type="password",
-            placeholder="Paste your sid cookie value here…",
-            label_visibility="collapsed",
-        )
-    with col_test:
-        test_clicked = st.button("Test Connection", use_container_width=True)
-    with col_btn:
-        run_clicked = st.button("Fetch & Assign", type="primary", use_container_width=True)
-
-    if not session_id:
-        st.markdown(
-            '<div class="info-box">Enter your Salesforce session ID above, then click '
-            '<strong>Test Connection</strong> to verify it works before running. '
-            'See the sidebar for how to get the session ID. If the test times out, '
-            'use <strong>Upload CSV Files</strong> mode instead.</div>',
-            unsafe_allow_html=True,
-        )
-
-    if test_clicked:
-        if not session_id.strip():
-            st.warning("Paste a session ID first.")
-        else:
-            with st.spinner("Testing connection…"):
-                result = test_connection(session_id.strip())
-
-            for step in result["steps"]:
-                icon = "**:green[PASS]**" if step["ok"] else "**:red[FAIL]**"
-                st.markdown(f"{icon} &nbsp; **{step['label']}** — {step['detail']}")
-
-            if result["ok"]:
-                st.success(
-                    f"Connection verified. All checks passed. "
-                    f"Click **Fetch & Assign** to run the assignment."
-                )
-            else:
-                failed = [s for s in result["steps"] if not s["ok"]]
-                if any("timed out" in s["detail"].lower() or "blocking" in s["detail"].lower()
-                       for s in failed):
-                    st.error(
-                        "Salesforce is blocking API requests from this server's IP address. "
-                        "This is a Salesforce security setting (session IP lock) and cannot be "
-                        "worked around from a cloud-hosted app.  \n"
-                        "**Switch to Upload CSV Files mode** — export both reports from Salesforce "
-                        "and upload them directly."
-                    )
-                elif any("invalid or expired" in s["detail"].lower() for s in failed):
-                    st.error(
-                        "Session ID is invalid or expired. Log back into Salesforce, "
-                        "open DevTools → Application → Cookies, copy a fresh `sid` value, and try again."
-                    )
-                else:
-                    st.warning("Some checks failed. Review the details above before running.")
-
-    if run_clicked:
-        if not session_id.strip():
-            st.error("Please enter a Salesforce session ID before running.")
-            st.stop()
-
-        with st.spinner("Fetching reports from Salesforce…"):
-            log_msgs = []
-            def log(msg): log_msgs.append(msg)
-
-            try:
-                with st.status("Connecting to Salesforce…", expanded=True) as sf_status:
-                    _sflog = lambda msg: sf_status.update(label=msg)
-                    sf_status.update(label="Fetching New Accounts report…")
-                    new_rows = fetch_report(
-                        session_id.strip(), RPT_NEW_ACCOUNTS, status_fn=_sflog
-                    )
-                    sf_status.update(
-                        label=f"New Accounts: {len(new_rows)} rows.  Fetching Account Volumes…"
-                    )
-                    vol_rows = fetch_report(
-                        session_id.strip(), RPT_VOLUMES, status_fn=_sflog
-                    )
-                    sf_status.update(
-                        label=f"Volumes: {len(vol_rows)} rows.  Running algorithm…",
-                        state="running",
-                    )
-                    payload = run_assignment(new_rows, vol_rows, active_overrides)
-                    sf_status.update(label="Complete.", state="complete")
-
-                st.session_state["payload"]    = payload
-                st.session_state["new_rows_n"] = len(new_rows)
-                st.session_state["vol_rows_n"] = len(vol_rows)
-
-            except PermissionError:
-                st.error(
-                    "**Authentication failed.** Your session ID is invalid or expired.  \n"
-                    "Log back into Salesforce, copy a fresh `sid` cookie value, and try again."
-                )
-                st.stop()
-            except TimeoutError as e:
-                st.error(
-                    f"**Salesforce report timed out.**  \n{e}  \n\n"
-                    "This can happen when the Salesforce async queue is slow.  \n"
-                    "**Try again in a minute**, or switch to **Upload CSV Files** mode — "
-                    "export both reports from Salesforce as CSV and upload them directly."
-                )
-                st.stop()
-            except Exception as e:
-                st.error(
-                    f"**Unexpected error:** {e}  \n\n"
-                    "If the problem persists, switch to **Upload CSV Files** mode."
-                )
-                st.stop()
 
 
 # ── Results display ───────────────────────────────────────────────────────────
