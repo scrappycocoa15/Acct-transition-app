@@ -534,6 +534,12 @@ def preprocess_accounts(rows: list):
         valid.append(row)
     return valid, bad
 
+# Maximum accounts_needed gap between the best eligible CSE and a partner
+# before partnership preference is ignored in favour of pure volume balance.
+# A partner is only preferred when their volume deficit is within this many
+# accounts of the most under-stocked eligible CSE.
+PARTNERSHIP_WINDOW = 3
+
 def _eligible(pool: dict) -> list:
     return [n for n, s in pool.items() if s["accounts_needed"] > 0]
 
@@ -547,18 +553,38 @@ def _update(pool: dict, n: str, arr: float, is_sub75k: bool):
         s["sub75k_count"] += 1
     s["sub75k_ratio"] = s["sub75k_count"] / s["current_count"]
 
+def _within_window(best_needed: float, candidate_needed: float) -> bool:
+    """True when the candidate is no more than PARTNERSHIP_WINDOW accounts
+    behind the most under-stocked eligible CSE."""
+    return (best_needed - candidate_needed) <= PARTNERSHIP_WINDOW
+
 def _pick_key(account: dict, pool: dict, priority: str | None, p_done: bool) -> str | None:
     elig = _eligible(pool)
     if not elig:
         return None
     if priority and not p_done and priority in elig:
         return priority
-    partnered = get_partnered_cses("Key", account["ob_csm"])
+
+    # Sub-$7.5k: pure volume balance only, partnership never applies
     if account["is_sub75k"]:
         return sorted(elig, key=lambda n: (-pool[n]["accounts_needed"], pool[n]["sub75k_ratio"], n))[0]
-    pe = [n for n in elig if n in partnered]
-    src = pe if pe else elig
-    return sorted(src, key=lambda n: (-pool[n]["accounts_needed"], -pool[n]["sub75k_ratio"], n))[0]
+
+    # Over $7.5k: sort all eligible by volume first
+    elig_sorted = sorted(elig, key=lambda n: (-pool[n]["accounts_needed"], -pool[n]["sub75k_ratio"], n))
+    best        = elig_sorted[0]
+    best_needed = pool[best]["accounts_needed"]
+
+    # Partnership only applies when the partner is within PARTNERSHIP_WINDOW
+    # accounts of the most under-stocked CSE
+    partnered = get_partnered_cses("Key", account["ob_csm"])
+    close_partners = [
+        n for n in elig
+        if n in partnered and _within_window(best_needed, pool[n]["accounts_needed"])
+    ]
+    if close_partners:
+        return sorted(close_partners, key=lambda n: (-pool[n]["accounts_needed"], -pool[n]["sub75k_ratio"], n))[0]
+
+    return best
 
 def _pick_sp(account: dict, pool: dict, segment: str, priority: str | None, p_done: bool) -> str | None:
     elig = _eligible(pool)
@@ -566,10 +592,23 @@ def _pick_sp(account: dict, pool: dict, segment: str, priority: str | None, p_do
         return None
     if priority and not p_done and priority in elig:
         return priority
+
+    # Sort all eligible by volume first
+    elig_sorted = sorted(elig, key=lambda n: (-pool[n]["accounts_needed"], -pool[n]["arr_gap"], n))
+    best        = elig_sorted[0]
+    best_needed = pool[best]["accounts_needed"]
+
+    # Partnership only applies when the partner is within PARTNERSHIP_WINDOW
+    # accounts of the most under-stocked CSE
     partnered = get_partnered_cses(segment, account["ob_csm"])
-    pe  = [n for n in elig if n in partnered]
-    src = pe if pe else elig
-    return sorted(src, key=lambda n: (-pool[n]["accounts_needed"], -pool[n]["arr_gap"], n))[0]
+    close_partners = [
+        n for n in elig
+        if n in partnered and _within_window(best_needed, pool[n]["accounts_needed"])
+    ]
+    if close_partners:
+        return sorted(close_partners, key=lambda n: (-pool[n]["accounts_needed"], -pool[n]["arr_gap"], n))[0]
+
+    return best
 
 def run_assignment(new_rows: list, vol_rows: list, overrides: dict) -> dict:
     valid, bad = preprocess_accounts(new_rows)
