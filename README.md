@@ -1,71 +1,59 @@
-# CSE Assignment Tool — Streamlit
+# CSE Account Assignment Tool
 
-Automates RSE → CSE account transitions by fetching live Salesforce data, applying the balancing algorithm, and exporting results as Excel.
+## Quickstart
 
----
+### 1. Export reports from Salesforce (recommended workflow)
 
-## Option A — Deploy to Streamlit Community Cloud (no local hosting)
+For each of the two reports below:
+1. Open the report in Salesforce
+2. Click **Export** (top-right corner)
+3. Select **Details Only**
+4. Click **Export** → choose **Formatted Report: CSV**
 
-1. Create a free account at [streamlit.io](https://streamlit.io)
-2. Push `streamlit_app.py` and `requirements.txt` to a **GitHub repo** (can be private)
-3. In Streamlit Cloud, click **New app** → connect the repo → set main file to `streamlit_app.py`
-4. Click **Deploy** — your app will be live at a `*.streamlit.app` URL
+| Report | Salesforce ID |
+|--------|--------------|
+| New Accounts Transitioning | `00O0e000005i4gg` |
+| Current Account Volumes | `00O7V000006IT4i` |
 
-> Streamlit Community Cloud is free for public and private repos.
-
----
-
-## Option B — Run locally
+### 2. Run the app locally
 
 ```bash
 pip install -r requirements.txt
 streamlit run streamlit_app.py
 ```
 
-App opens at `http://localhost:8501`.
+### 3. Upload and run
+
+- The app opens in **Upload CSV Files** mode by default
+- Upload both CSV exports
+- Click **Run Assignment**
+- Download the Excel output
 
 ---
 
-## How to get your Salesforce Session ID
+## Deploy to Streamlit Community Cloud (free)
 
-1. Log into Salesforce in Chrome or Edge
-2. Open **DevTools** (F12) → **Application** → **Cookies** → `https://sapconcur.my.salesforce.com`
-3. Copy the value of the **`sid`** cookie
-4. Paste it into the app and click **Fetch & Assign**
-
-Session IDs expire after ~2 hours of inactivity or on logout.
+1. Push this folder to a GitHub repo
+2. Go to [share.streamlit.io](https://share.streamlit.io) → **New app**
+3. Point to your repo and `streamlit_app.py`
+4. Deploy — no secrets or environment variables needed
 
 ---
 
-## What the app does
+## Live Salesforce Fetch (optional)
 
-| Step | Action |
-|------|--------|
-| 1 | Fetches **New Accounts Transitioning** report (`00O0e000005i4gg`) via Salesforce Async Analytics API |
-| 2 | Fetches **Current Account Volumes** report (`00O7V000006IT4i`) |
-| 3 | Builds active CSE pool per segment — excludes anyone with < 20 accounts |
-| 4 | Runs the RSE → CSE assignment algorithm: volume balance → OB CSM partnership → ARR parity |
-| 5 | Applies monthly overrides (Tom Wahl / Alex Capeloto) — toggleable in the sidebar |
-| 6 | Displays results with highlighted new-owner columns |
-| 7 | Exports `cse_assignments.xlsx` with three sheets: **Assignments**, **Exceptions**, **CSE Summary** |
+Switch to **Live Salesforce Fetch** mode and paste your `sid` cookie value.  
+To get the `sid` cookie: DevTools → Application → Cookies → `sapconcur.my.salesforce.com` → copy `sid` value.
+
+> **Note:** Live fetch may time out when the app is hosted on Streamlit Cloud because  
+> Salesforce locks session tokens to the originating browser IP. CSV upload is more reliable.
 
 ---
 
-## Updating monthly overrides
+## Output: cse_assignments.xlsx
 
-Toggle the checkboxes in the **Settings** sidebar before clicking Fetch & Assign. No code changes needed.
-
-To permanently change the defaults, edit `MONTHLY_OVERRIDES` at the top of `streamlit_app.py`:
-
-```python
-active_overrides = {
-    "Strategic": {"Thomas Wahl": 1},
-    "Premier":   {"Alex Capeloto": 1},
-}
-```
-
----
-
-## Updating the CSE roster or partnerships
-
-The CSE roster and OB CSM partnerships are embedded in `streamlit_app.py`. Search for `_RAW_CSES` (roster) and `_STRAT_P` / `_PREMIER_P` / `_KEY_P` (partnerships) to make changes.
+| Sheet | Contents |
+|-------|----------|
+| Assignments | All assigned accounts — new-owner columns highlighted blue, override rows highlighted yellow |
+| Exceptions | Accounts that could not be assigned (missing CS Team, no eligible CSE, etc.) |
+| CSE Summary | Pre/post account counts and ARR per rep — rows receiving accounts highlighted green |

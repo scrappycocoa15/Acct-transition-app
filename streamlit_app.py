@@ -358,36 +358,189 @@ def parse_sf_report(data: dict) -> list:
         rows.append(row)
     return rows
 
-def fetch_report(sid: str, report_id: str, status_fn=None, timeout_s: int = 180) -> list:
-    """Async Salesforce Analytics API fetch — no 2 000-row cap."""
-    base = f"{SF_INSTANCE}/services/data/{SF_API_VER}/analytics/reports/{report_id}"
-    hdrs = sf_headers(sid)
+def test_connection(sid: str) -> dict:
+    """
+    Lightweight 3-step connection check — no report data is fetched.
 
-    resp = requests.post(f"{base}/instances", headers=hdrs, json={}, timeout=60)
-    if resp.status_code == 401:
-        raise PermissionError("Invalid or expired session ID.")
-    resp.raise_for_status()
-    instance_url = resp.json().get("url", "")
-    if not instance_url:
-        raise ValueError("Salesforce returned no instance URL.")
+    Step 1: GET /services/data/v59.0/          — verifies the session is valid
+    Step 2: GET /services/oauth2/userinfo       — returns the logged-in user's name
+    Step 3: GET /analytics/reports/{id}/describe — confirms each report is accessible
+                                                   (metadata only, does NOT run the report)
 
-    poll_url = f"{SF_INSTANCE}{instance_url}"
-    deadline = time.time() + timeout_s
-    attempt  = 0
-    while time.time() < deadline:
-        attempt += 1
-        pr = requests.get(poll_url, headers=hdrs, timeout=60)
-        pr.raise_for_status()
-        pdata  = pr.json()
-        status = pdata.get("status", "Running")
+    Returns:
+        {
+          "steps": [{"label": str, "ok": bool, "detail": str}, ...],
+          "user":  str,   # display name from identity endpoint
+          "ok":    bool,  # True only if all steps passed
+        }
+    """
+    hdrs  = sf_headers(sid)
+    steps = []
+    user  = ""
+
+    # ── Step 1: basic auth ─────────────────────────────────────────────────────
+    try:
+        r = requests.get(
+            f"{SF_INSTANCE}/services/data/{SF_API_VER}/",
+            headers=hdrs, timeout=15,
+        )
+        if r.status_code == 401:
+            steps.append({"label": "Session valid", "ok": False,
+                          "detail": "Session ID is invalid or expired. Copy a fresh sid cookie."})
+            return {"steps": steps, "user": user, "ok": False}
+        r.raise_for_status()
+        steps.append({"label": "Session valid", "ok": True, "detail": "Salesforce accepted the session ID."})
+    except requests.exceptions.Timeout:
+        steps.append({"label": "Session valid", "ok": False,
+                      "detail": "Request timed out. Salesforce is likely blocking API calls from "
+                                "this server's IP address. Use CSV upload instead."})
+        return {"steps": steps, "user": user, "ok": False}
+    except Exception as e:
+        steps.append({"label": "Session valid", "ok": False, "detail": f"Connection error: {e}"})
+        return {"steps": steps, "user": user, "ok": False}
+
+    # ── Step 2: identity / logged-in user ──────────────────────────────────────
+    try:
+        ur = requests.get(
+            f"{SF_INSTANCE}/services/oauth2/userinfo",
+            headers=hdrs, timeout=15,
+        )
+        if ur.ok:
+            ud   = ur.json()
+            user = ud.get("name") or ud.get("preferred_username") or ud.get("email") or ""
+            steps.append({"label": "User identity", "ok": True,
+                          "detail": f"Logged in as: {user}"})
+        else:
+            steps.append({"label": "User identity", "ok": False,
+                          "detail": f"Could not retrieve user info (HTTP {ur.status_code})."})
+    except Exception as e:
+        steps.append({"label": "User identity", "ok": False, "detail": f"Identity check failed: {e}"})
+
+    # ── Step 3: report access (describe — metadata only, no rows fetched) ──────
+    for rpt_name, rpt_id in [
+        ("New Accounts report", RPT_NEW_ACCOUNTS),
+        ("Account Volumes report", RPT_VOLUMES),
+    ]:
+        try:
+            rr = requests.get(
+                f"{SF_INSTANCE}/services/data/{SF_API_VER}/analytics/reports/{rpt_id}/describe",
+                headers=hdrs, timeout=15,
+            )
+            if rr.status_code == 200:
+                meta  = rr.json()
+                rname = meta.get("reportMetadata", {}).get("name", rpt_id)
+                steps.append({"label": rpt_name, "ok": True,
+                              "detail": f"Accessible — \"{rname}\""})
+            elif rr.status_code == 404:
+                steps.append({"label": rpt_name, "ok": False,
+                              "detail": f"Report {rpt_id} not found. Check the report ID."})
+            elif rr.status_code == 401:
+                steps.append({"label": rpt_name, "ok": False,
+                              "detail": "Access denied. Your user may not have permission to this report."})
+            else:
+                steps.append({"label": rpt_name, "ok": False,
+                              "detail": f"HTTP {rr.status_code}: {rr.text[:120]}"})
+        except requests.exceptions.Timeout:
+            steps.append({"label": rpt_name, "ok": False,
+                          "detail": "Request timed out. Analytics API may be blocked from this server."})
+        except Exception as e:
+            steps.append({"label": rpt_name, "ok": False, "detail": f"Check failed: {e}"})
+
+    all_ok = all(s["ok"] for s in steps)
+    return {"steps": steps, "user": user, "ok": all_ok}
+
+
+def fetch_report(sid: str, report_id: str, status_fn=None, timeout_s: int = 90) -> list:
+    """
+    Fetch all rows from a Salesforce Analytics report.
+
+    Strategy:
+      1. Try the synchronous API first (?includeDetails=true).
+         - For small reports (new accounts) this returns immediately with allData=true.
+         - Fast, no queueing, no polling.
+      2. If allData=false (>2 000 rows), fall back to the async Instances API.
+         - Gives Salesforce 3 s to start the job, then polls every 4 s.
+      3. If async times out, return whatever sync gave us and set a warning flag
+         so the caller can surface it to the user.
+    """
+    base  = f"{SF_INSTANCE}/services/data/{SF_API_VER}/analytics/reports/{report_id}"
+    hdrs  = sf_headers(sid)
+    sync_rows = []
+
+    # ── Step 1: synchronous fetch ──────────────────────────────────────────────
+    if status_fn:
+        status_fn(f"Fetching report {report_id}…")
+    try:
+        resp = requests.get(f"{base}?includeDetails=true", headers=hdrs, timeout=60)
+        if resp.status_code == 401:
+            raise PermissionError("Invalid or expired session ID.")
+        resp.raise_for_status()
+        data      = resp.json()
+        sync_rows = parse_sf_report(data)
+        if data.get("allData", True):
+            return sync_rows          # ← all rows returned; done
         if status_fn:
-            status_fn(f"Polling report {report_id} (attempt {attempt}) — status: {status}")
-        if status == "Success":
-            return parse_sf_report(pdata)
-        if status == "Failed":
-            raise RuntimeError(f"Report {report_id} failed: {pdata.get('errorCode','Unknown')}")
-        time.sleep(2)
-    raise TimeoutError(f"Report {report_id} timed out after {timeout_s}s.")
+            status_fn(f"Report has >2 000 rows — switching to async fetch…")
+    except PermissionError:
+        raise
+    except Exception as sync_err:
+        if status_fn:
+            status_fn(f"Sync attempt failed ({sync_err}) — trying async…")
+
+    # ── Step 2: async fallback ─────────────────────────────────────────────────
+    try:
+        r2 = requests.post(f"{base}/instances", headers=hdrs, json={}, timeout=60)
+        if r2.status_code == 401:
+            raise PermissionError("Invalid or expired session ID.")
+        r2.raise_for_status()
+        instance_url = r2.json().get("url", "")
+        if not instance_url:
+            raise ValueError("Salesforce returned no instance URL.")
+
+        poll_url = f"{SF_INSTANCE}{instance_url}"
+        time.sleep(3)                 # give SF a moment to start the job
+        deadline = time.time() + timeout_s
+        attempt  = 0
+        while time.time() < deadline:
+            attempt += 1
+            pr = requests.get(poll_url, headers=hdrs, timeout=60)
+            pr.raise_for_status()
+            pdata  = pr.json()
+            status = pdata.get("status", "Running")
+            if status_fn:
+                status_fn(f"Async poll {attempt} — {status}")
+            if status == "Success":
+                return parse_sf_report(pdata)
+            if status == "Failed":
+                raise RuntimeError(
+                    f"Report {report_id} failed: {pdata.get('errorCode', 'Unknown')}"
+                )
+            time.sleep(4)
+
+        # Async timed out — surface partial sync data with a warning
+        if sync_rows:
+            if status_fn:
+                status_fn(
+                    f"⚠ Async timed out — using partial sync data ({len(sync_rows)} rows). "
+                    f"Account-volume counts may be understated for large segments."
+                )
+            return sync_rows
+        raise TimeoutError(
+            f"Report {report_id} timed out after {timeout_s}s. "
+            f"Try the CSV upload option below, or re-run after a few minutes."
+        )
+
+    except (PermissionError, RuntimeError):
+        raise
+    except TimeoutError:
+        raise
+    except Exception as async_err:
+        if sync_rows:
+            return sync_rows          # partial data is better than nothing
+        raise RuntimeError(
+            f"Could not fetch report {report_id}: {async_err}. "
+            f"Try the CSV upload option below."
+        )
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ALGORITHM
@@ -667,7 +820,7 @@ st.markdown("""
 <div class="tool-header">
   <div>
     <h1>CSE Account Assignment Tool</h1>
-    <p>Fetches live Salesforce data &nbsp;·&nbsp; Applies RSE → CSE balancing algorithm &nbsp;·&nbsp; Exports to Excel</p>
+    <p>Upload Salesforce CSV exports &nbsp;·&nbsp; Applies RSE → CSE balancing algorithm &nbsp;·&nbsp; Exports to Excel</p>
   </div>
 </div>
 """, unsafe_allow_html=True)
@@ -682,15 +835,22 @@ with st.sidebar:
     alex_override = st.checkbox("Alex Capeloto — min. 1 account", value=True)
 
     st.divider()
-    st.markdown("### How to get your Session ID")
+    st.markdown("### How to export from Salesforce")
     st.markdown("""
-1. Log into Salesforce in Chrome or Edge
-2. Open **DevTools** → **Application** → **Cookies**
-3. Find `sapconcur.my.salesforce.com`
-4. Copy the value of the **`sid`** cookie
-5. Paste it below and click **Fetch & Assign**
+**New Accounts report** (`00O0e000005i4gg`)  
+**Account Volumes report** (`00O7V000006IT4i`)
 
-Session IDs expire after ~2 hours of inactivity or on logout.
+For each report:
+1. Open the report in Salesforce
+2. Click **Export** (top-right)
+3. Choose **Details Only**
+4. Click **Export** → **Formatted Report: CSV**
+5. Upload both files in the app
+
+---
+**Live fetch option**  
+Switch to **Live Salesforce Fetch** mode and paste your `sid` cookie (DevTools → Application → Cookies → `sapconcur.my.salesforce.com`).  
+Note: this may time out if Salesforce restricts API calls from cloud servers. CSV upload is more reliable.
 """)
 
 # ── Overrides dict from sidebar ───────────────────────────────────────────────
@@ -699,59 +859,190 @@ active_overrides = {
     "Premier":   {"Alex Capeloto": 1} if alex_override else {},
 }
 
-# ── Input row ────────────────────────────────────────────────────────────────
-col_input, col_btn = st.columns([5, 1])
-with col_input:
-    session_id = st.text_input(
-        "Salesforce Session ID",
-        type="password",
-        placeholder="Paste your sid cookie value here…",
-        label_visibility="collapsed",
-    )
-with col_btn:
-    run_clicked = st.button("Fetch & Assign", type="primary", use_container_width=True)
+# ── Input mode toggle ────────────────────────────────────────────────────────
+st.markdown(
+    '<div class="info-box">'
+    '<strong>Recommended workflow:</strong> Export both Salesforce reports as CSV and upload them below. '
+    'The live Salesforce fetch can time out because Salesforce restricts API calls that originate '
+    'from cloud servers (IP mismatch with your browser session). CSV upload is instant and fully reliable.'
+    '</div>',
+    unsafe_allow_html=True,
+)
 
-if not session_id:
+input_mode = st.radio(
+    "Data source",
+    ["Upload CSV Files", "Live Salesforce Fetch"],
+    horizontal=True,
+    label_visibility="collapsed",
+)
+
+new_rows = None
+vol_rows = None
+run_clicked = False
+
+if input_mode == "Upload CSV Files":
     st.markdown(
-        '<div class="info-box">Enter your Salesforce session ID above, then click '
-        '<strong>Fetch & Assign</strong>. See the sidebar for instructions.</div>',
+        '<div class="info-box">'
+        'In Salesforce, open each report → click <strong>Export</strong> → <strong>Details Only</strong> → <strong>Export</strong> → choose <strong>Formatted Report: CSV</strong>. '
+        'Upload both files below.'
+        '</div>',
         unsafe_allow_html=True,
     )
+    cu1, cu2 = st.columns(2)
+    with cu1:
+        new_file = st.file_uploader(
+            "New Accounts Transitioning (report 00O0e000005i4gg)",
+            type=["csv", "xlsx"],
+            key="upload_new",
+        )
+    with cu2:
+        vol_file = st.file_uploader(
+            "Current Account Volumes (report 00O7V000006IT4i)",
+            type=["csv", "xlsx"],
+            key="upload_vol",
+        )
 
-# ── Run logic ─────────────────────────────────────────────────────────────────
-if run_clicked:
-    if not session_id.strip():
-        st.error("Please enter a Salesforce session ID before running.")
-        st.stop()
+    run_clicked = st.button(
+        "Run Assignment", type="primary",
+        disabled=(new_file is None or vol_file is None),
+    )
 
-    with st.spinner("Fetching reports from Salesforce…"):
-        log_msgs = []
-        def log(msg):
-            log_msgs.append(msg)
-
+    if run_clicked:
         try:
-            with st.status("Connecting to Salesforce…", expanded=False) as status:
-                status.update(label="Fetching New Accounts report…")
-                new_rows = fetch_report(session_id.strip(), RPT_NEW_ACCOUNTS, status_fn=log)
-                status.update(label=f"New Accounts report: {len(new_rows)} rows. Fetching Account Volumes…")
-                vol_rows = fetch_report(session_id.strip(), RPT_VOLUMES, status_fn=log)
-                status.update(label=f"Account Volumes: {len(vol_rows)} rows. Running algorithm…")
-                payload  = run_assignment(new_rows, vol_rows, active_overrides)
-                status.update(label="Done.", state="complete")
+            def _read_upload(f):
+                if f.name.endswith(".xlsx"):
+                    df = pd.read_excel(f, dtype=str)
+                else:
+                    df = pd.read_csv(f, dtype=str)
+                df = df.fillna("")
+                return df.to_dict(orient="records")
+
+            new_rows = _read_upload(new_file)
+            vol_rows = _read_upload(vol_file)
+
+            with st.spinner("Running assignment algorithm…"):
+                payload = run_assignment(new_rows, vol_rows, active_overrides)
 
             st.session_state["payload"]    = payload
             st.session_state["new_rows_n"] = len(new_rows)
             st.session_state["vol_rows_n"] = len(vol_rows)
 
-        except PermissionError as e:
-            st.error(f"Authentication failed: {e}")
-            st.stop()
-        except TimeoutError as e:
-            st.error(f"Timeout: {e}")
-            st.stop()
         except Exception as e:
-            st.error(f"Error: {e}")
+            st.error(f"**Error processing uploaded files:** {e}")
             st.stop()
+
+elif input_mode == "Live Salesforce Fetch":
+    col_input, col_test, col_btn = st.columns([5, 1.4, 1.4])
+    with col_input:
+        session_id = st.text_input(
+            "Salesforce Session ID",
+            type="password",
+            placeholder="Paste your sid cookie value here…",
+            label_visibility="collapsed",
+        )
+    with col_test:
+        test_clicked = st.button("Test Connection", use_container_width=True)
+    with col_btn:
+        run_clicked = st.button("Fetch & Assign", type="primary", use_container_width=True)
+
+    if not session_id:
+        st.markdown(
+            '<div class="info-box">Enter your Salesforce session ID above, then click '
+            '<strong>Test Connection</strong> to verify it works before running. '
+            'See the sidebar for how to get the session ID. If the test times out, '
+            'use <strong>Upload CSV Files</strong> mode instead.</div>',
+            unsafe_allow_html=True,
+        )
+
+    if test_clicked:
+        if not session_id.strip():
+            st.warning("Paste a session ID first.")
+        else:
+            with st.spinner("Testing connection…"):
+                result = test_connection(session_id.strip())
+
+            for step in result["steps"]:
+                icon = "**:green[PASS]**" if step["ok"] else "**:red[FAIL]**"
+                st.markdown(f"{icon} &nbsp; **{step['label']}** — {step['detail']}")
+
+            if result["ok"]:
+                st.success(
+                    f"Connection verified. All checks passed. "
+                    f"Click **Fetch & Assign** to run the assignment."
+                )
+            else:
+                failed = [s for s in result["steps"] if not s["ok"]]
+                if any("timed out" in s["detail"].lower() or "blocking" in s["detail"].lower()
+                       for s in failed):
+                    st.error(
+                        "Salesforce is blocking API requests from this server's IP address. "
+                        "This is a Salesforce security setting (session IP lock) and cannot be "
+                        "worked around from a cloud-hosted app.  \n"
+                        "**Switch to Upload CSV Files mode** — export both reports from Salesforce "
+                        "and upload them directly."
+                    )
+                elif any("invalid or expired" in s["detail"].lower() for s in failed):
+                    st.error(
+                        "Session ID is invalid or expired. Log back into Salesforce, "
+                        "open DevTools → Application → Cookies, copy a fresh `sid` value, and try again."
+                    )
+                else:
+                    st.warning("Some checks failed. Review the details above before running.")
+
+    if run_clicked:
+        if not session_id.strip():
+            st.error("Please enter a Salesforce session ID before running.")
+            st.stop()
+
+        with st.spinner("Fetching reports from Salesforce…"):
+            log_msgs = []
+            def log(msg): log_msgs.append(msg)
+
+            try:
+                with st.status("Connecting to Salesforce…", expanded=True) as sf_status:
+                    _sflog = lambda msg: sf_status.update(label=msg)
+                    sf_status.update(label="Fetching New Accounts report…")
+                    new_rows = fetch_report(
+                        session_id.strip(), RPT_NEW_ACCOUNTS, status_fn=_sflog
+                    )
+                    sf_status.update(
+                        label=f"New Accounts: {len(new_rows)} rows.  Fetching Account Volumes…"
+                    )
+                    vol_rows = fetch_report(
+                        session_id.strip(), RPT_VOLUMES, status_fn=_sflog
+                    )
+                    sf_status.update(
+                        label=f"Volumes: {len(vol_rows)} rows.  Running algorithm…",
+                        state="running",
+                    )
+                    payload = run_assignment(new_rows, vol_rows, active_overrides)
+                    sf_status.update(label="Complete.", state="complete")
+
+                st.session_state["payload"]    = payload
+                st.session_state["new_rows_n"] = len(new_rows)
+                st.session_state["vol_rows_n"] = len(vol_rows)
+
+            except PermissionError:
+                st.error(
+                    "**Authentication failed.** Your session ID is invalid or expired.  \n"
+                    "Log back into Salesforce, copy a fresh `sid` cookie value, and try again."
+                )
+                st.stop()
+            except TimeoutError as e:
+                st.error(
+                    f"**Salesforce report timed out.**  \n{e}  \n\n"
+                    "This can happen when the Salesforce async queue is slow.  \n"
+                    "**Try again in a minute**, or switch to **Upload CSV Files** mode — "
+                    "export both reports from Salesforce as CSV and upload them directly."
+                )
+                st.stop()
+            except Exception as e:
+                st.error(
+                    f"**Unexpected error:** {e}  \n\n"
+                    "If the problem persists, switch to **Upload CSV Files** mode."
+                )
+                st.stop()
+
 
 # ── Results display ───────────────────────────────────────────────────────────
 if "payload" in st.session_state:
