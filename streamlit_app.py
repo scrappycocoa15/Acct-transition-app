@@ -6,6 +6,7 @@ fetches two reports, applies RSE→CSE assignment algorithm, exports to Excel.
 
 import io, re, time, math, xml.etree.ElementTree as ET
 from collections import defaultdict
+from datetime import datetime
 
 import requests
 import openpyxl
@@ -1011,13 +1012,31 @@ if "payload" in st.session_state:
 
     # ── Download button ───────────────────────────────────────────────────────
     excel_bytes = build_excel(payload)
-    st.download_button(
-        label="⬇  Download Excel  (Assignments + Exceptions + CSE Summary)",
-        data=excel_bytes,
-        file_name="cse_assignments.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        type="primary",
-    )
+    dl_col, email_col = st.columns([3, 2])
+    with dl_col:
+        st.download_button(
+            label="⬇  Download Excel  (Assignments + Exceptions + CSE Summary)",
+            data=excel_bytes,
+            file_name="cse_assignments.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            type="primary",
+            use_container_width=True,
+        )
+    with email_col:
+        import urllib.parse
+        _month_label = datetime.now().strftime("%B %Y")
+        _subject = urllib.parse.quote(f"CSE Account Reassignment — {_month_label}")
+        _body    = urllib.parse.quote(
+            "Hi team,\n"
+            "Can you please reassign the attached accounts and update the FY18 Sales Planning field?"
+        )
+        _mailto  = f"mailto:concur_fieldservices@sap.com?subject={_subject}&body={_body}"
+        st.link_button(
+            "✉  Email to Field Services",
+            _mailto,
+            use_container_width=True,
+        )
+        st.caption("Opens your mail client · attach the Excel file before sending")
 
     st.divider()
 
