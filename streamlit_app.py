@@ -807,13 +807,6 @@ st.markdown("""
 
 # ── Sidebar — settings ───────────────────────────────────────────────────────
 with st.sidebar:
-    st.markdown("### Settings")
-    st.caption("Monthly overrides give the named CSE their first account before normal rules apply.")
-    st.markdown("**Strategic**")
-    tom_override = st.checkbox("Tom Wahl — min. 1 account", value=True)
-    st.markdown("**Premier**")
-    alex_override = st.checkbox("Alex Capeloto — min. 1 account", value=True)
-
     st.divider()
     st.markdown("### How to get your Session ID")
     st.markdown("""
@@ -834,10 +827,7 @@ For each report: open in Salesforce → **Export** → **Details Only** → **Fo
 """)
 
 # ── Overrides dict from sidebar ───────────────────────────────────────────────
-active_overrides = {
-    "Strategic": {"Thomas Wahl": 1} if tom_override else {},
-    "Premier":   {"Alex Capeloto": 1} if alex_override else {},
-}
+active_overrides = {"Strategic": {}, "Premier": {}}
 
 # ── Input mode toggle ────────────────────────────────────────────────────────
 input_mode = st.radio(
