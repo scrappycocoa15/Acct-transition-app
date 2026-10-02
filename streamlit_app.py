@@ -746,7 +746,7 @@ def build_excel(payload: dict) -> bytes:
     results  = payload.get("results", [])
     _internal = {"segment","ob_csm","arr","is_sub75k","_winner_norm","_exception",
                  "_exception_detail","_override"}
-    new_cols  = ["New Account Owner", "New Account Owner ID"]
+    new_cols  = ["New Account Owner", "New Account Owner ID", "FY18 Sales Planning"]
 
     if results:
         base_cols = [k for k in results[0] if k not in _internal and k not in new_cols]
