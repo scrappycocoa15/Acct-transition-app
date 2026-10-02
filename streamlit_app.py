@@ -469,27 +469,39 @@ _FY18_FIELD = "FY18 Sales Planning"
 
 def clean_fy18(val: str) -> str:
     """
-    Remove all 'Prev Acct Owner: ...' tags from the FY18 Sales Planning field.
-    Handles common separators (|  ;  ,  newline) before/after the tag so the
-    remaining text stays clean.
+    Remove all 'Prev Acct Owner: ...' and 'Prev Account Owner: ...' tags from
+    the FY18 Sales Planning field.
+
+    Real-world format: tags are space-delimited (no pipe/comma required) and
+    follow the pattern:  Prev Acct(ount)? Owner: [Name] [optional 2-4 digit year]
 
     Examples:
-      "Prev Acct Owner: Jane Doe"                   → ""
-      "Prev Acct Owner: Jane Doe | Some note"        → "Some note"
-      "Some note | Prev Acct Owner: Jane Doe"        → "Some note"
-      "Note 1 | Prev Acct Owner: Jane Doe | Note 2"  → "Note 1 | Note 2"
+      "Prev Acct Owner: Jane Doe 24"                              → ""
+      "2026-US MM to US GB Prev Acct Owner: Jane Doe 24"          → "2026-US MM to US GB"
+      "2026-US MM to US GB Prev Acct Owner: Jane Doe 25 2025-US SB to US MM"
+                                                                  → "2026-US MM to US GB 2025-US SB to US MM"
+      "Prev Acct Owner: A 25 Prev Acct Owner: B 24"               → ""
+      "Prev Account Owner: Jane Doe 24"                           → ""
     """
     if not val:
         return val
     s = str(val)
-    # Remove tag that follows a separator (keep the separator's spacing normalised later)
-    s = re.sub(r'[|;,]\s*Prev Acct Owner\s*:[^|;,\n]*', '', s, flags=re.IGNORECASE)
-    # Remove tag at the very start (no preceding separator)
-    s = re.sub(r'^\s*Prev Acct Owner\s*:[^|;,\n]*', '', s, flags=re.IGNORECASE)
-    # Normalise spacing around remaining pipe separators
+    # Match "Prev Acct Owner:" or "Prev Account Owner:" followed by a name
+    # (letters, spaces, apostrophes, periods, hyphens) and an optional year number.
+    # No separator before the tag is required — handles space-delimited real data.
+    # "Acct" and "Account" are different strings — match both explicitly
+    s = re.sub(
+        r'Prev Acc(?:t|ount)\s+Owner\s*:\s*[A-Za-z][A-Za-z .\'\-]*(?:\s*\d+)?',
+        '', s, flags=re.IGNORECASE
+    )
+    # Normalise pipe separators
     s = re.sub(r'\s*\|\s*', ' | ', s)
-    # Clean up any leftover leading/trailing separators or whitespace
+    # Remove stray spaces immediately before ; or , (left by tag removal)
+    s = re.sub(r' +([;,])', r'\1', s)
+    # Remove leading/trailing separators and whitespace
     s = re.sub(r'^[\s|;,]+|[\s|;,]+$', '', s)
+    # Collapse multiple internal spaces
+    s = re.sub(r'  +', ' ', s)
     return s.strip()
 
 def build_pools(vol_rows: list, new_accounts: list) -> dict:
